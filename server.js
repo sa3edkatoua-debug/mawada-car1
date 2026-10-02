@@ -3,6 +3,7 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const http = require('http');
+const fs = require('fs');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -15,10 +16,23 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// الاتصال بقواعد البيانات وتجهيز الجداول
-const dbPath = path.join(__dirname, 'vehicles_database.db');
-const db = new sqlite3.Database(dbPath);
+// 1. تحديد مسار التخزين (يقرأ المجلد من Railway Volume أو يستخدم المجلد المحلي)
+const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
 
+// 2. ربط قاعدة البيانات SQLite داخل مجلد الـ Volume
+const dbPath = path.join(dataDir, 'vehicles_database.db');
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error('خطأ في الاتصال بقاعدة البيانات:', err.message);
+  } else {
+    console.log('تم الاتصال بقاعدة البيانات بنجاح في المسار:', dbPath);
+  }
+});
+
+// 3. تجهيز الجداول في قاعدة البيانات
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS vehicles (
     id TEXT PRIMARY KEY,
@@ -32,9 +46,10 @@ db.serialize(() => {
 
   db.run(`CREATE TABLE IF NOT EXISTS vehicle_models (name TEXT UNIQUE)`);
   db.run(`CREATE TABLE IF NOT EXISTS vehicle_colors (name TEXT UNIQUE)`);
+  db.run(`CREATE TABLE IF NOT EXISTS vehicle_owners (name TEXT UNIQUE)`);
 });
 
-// الاتصال عبر Socket
+// الاتصال عبر Socket.io للمزامنة اللحظية
 io.on('connection', (socket) => {
   console.log('جهاز جديد اتصل بالمزامنة اللحظية:', socket.id);
 });
@@ -67,37 +82,55 @@ app.post('/api/vehicles', (req, res) => {
   db.run(sql, [id, model, color, plateNumber, ownerName, entryTime, isInside ? 1 : 0], function (err) {
     if (err) return res.status(500).json({ error: err.message });
 
-    db.run(`INSERT OR IGNORE INTO vehicle_models (name) VALUES (?)`, [model]);
-    db.run(`INSERT OR IGNORE INTO vehicle_colors (name) VALUES (?)`, [color]);
+    if (model) db.run(`INSERT OR IGNORE INTO vehicle_models (name) VALUES (?)`, [model]);
+    if (color) db.run(`INSERT OR IGNORE INTO vehicle_colors (name) VALUES (?)`, [color]);
+    if (ownerName) db.run(`INSERT OR IGNORE INTO vehicle_owners (name) VALUES (?)`, [ownerName]);
 
-    // إرسال إشارة تحديث فورية لجميع الأجهزة
     io.emit('vehicles_updated');
-
     res.status(201).json({ message: 'تم الحفظ والمزامنة بنجاح' });
   });
 });
 
-// API: تحديث حالة السيارة
+// API: تعديل بيانات سيارة كاملة
+app.put('/api/vehicles/:id', (req, res) => {
+  const { id } = req.params;
+  const { model, color, plateNumber, ownerName } = req.body;
+  const sql = `UPDATE vehicles SET model = ?, color = ?, plate_number = ?, owner_name = ? WHERE id = ?`;
+
+  db.run(sql, [model, color, plateNumber, ownerName, id], function (err) {
+    if (err) return res.status(500).json({ error: err.message });
+
+    if (model) db.run(`INSERT OR IGNORE INTO vehicle_models (name) VALUES (?)`, [model]);
+    if (color) db.run(`INSERT OR IGNORE INTO vehicle_colors (name) VALUES (?)`, [color]);
+    if (ownerName) db.run(`INSERT OR IGNORE INTO vehicle_owners (name) VALUES (?)`, [ownerName]);
+
+    io.emit('vehicles_updated');
+    res.json({ message: 'تم تحديث البيانات والمزامنة بنجاح' });
+  });
+});
+
+// API: تحديث حالة السيارة (دخول / خروج)
 app.put('/api/vehicles/:id/status', (req, res) => {
   const { id } = req.params;
   const { isInside } = req.body;
   db.run(`UPDATE vehicles SET is_inside = ? WHERE id = ?`, [isInside ? 1 : 0, id], function (err) {
     if (err) return res.status(500).json({ error: err.message });
     
-    // إرسال إشارة تحديث فورية لجميع الأجهزة
     io.emit('vehicles_updated');
-
     res.json({ message: 'تم التحديث والمزامنة بنجاح' });
   });
 });
 
-// API: جلب الموديلات والألوان
+// API: جلب الموديلات، الألوان، وأسماء الملاك/المكاتب
 app.get('/api/options', (req, res) => {
   db.all(`SELECT name FROM vehicle_models`, [], (err, models) => {
     db.all(`SELECT name FROM vehicle_colors`, [], (err, colors) => {
-      res.json({
-        models: (models || []).map((m) => m.name),
-        colors: (colors || []).map((c) => c.name),
+      db.all(`SELECT name FROM vehicle_owners`, [], (err, owners) => {
+        res.json({
+          models: (models || []).map((m) => m.name),
+          colors: (colors || []).map((c) => c.name),
+          owners: (owners || []).map((o) => o.name),
+        });
       });
     });
   });
@@ -108,7 +141,7 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'web_build', 'index.html'));
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`السيرفر يعمل بنجاح ومستعد للمزامنة على المنفذ ${PORT}`);
 });
