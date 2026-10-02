@@ -1,9 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
 const http = require('http');
-const fs = require('fs');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -16,38 +15,36 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// 1. تحديد مسار التخزين (يقرأ المجلد من Railway Volume أو يستخدم المجلد المحلي)
-const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
+// 1. الاتصال بقاعدة بيانات Supabase عبر متغير البيئة DATABASE_URL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-// 2. ربط قاعدة البيانات SQLite داخل مجلد الـ Volume
-const dbPath = path.join(dataDir, 'vehicles_database.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('خطأ في الاتصال بقاعدة البيانات:', err.message);
-  } else {
-    console.log('تم الاتصال بقاعدة البيانات بنجاح في المسار:', dbPath);
+// 2. إنشاء الجداول تلقائياً إن لم تكن موجودة عند تشغيل السيرفر
+const initDB = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vehicles (
+        id VARCHAR(255) PRIMARY KEY,
+        model TEXT,
+        color TEXT,
+        plate_number TEXT,
+        owner_name TEXT,
+        entry_time TEXT,
+        is_inside BOOLEAN DEFAULT true
+      );
+
+      CREATE TABLE IF NOT EXISTS vehicle_models (name TEXT UNIQUE);
+      CREATE TABLE IF NOT EXISTS vehicle_colors (name TEXT UNIQUE);
+      CREATE TABLE IF NOT EXISTS vehicle_owners (name TEXT UNIQUE);
+    `);
+    console.log('تم الاتصال بـ Supabase وإنشاء الجداول بنجاح');
+  } catch (err) {
+    console.error('خطأ في تهيئة قاعدة بيانات Supabase:', err.message);
   }
-});
-
-// 3. تجهيز الجداول في قاعدة البيانات
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS vehicles (
-    id TEXT PRIMARY KEY,
-    model TEXT,
-    color TEXT,
-    plate_number TEXT,
-    owner_name TEXT,
-    entry_time TEXT,
-    is_inside INTEGER
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS vehicle_models (name TEXT UNIQUE)`);
-  db.run(`CREATE TABLE IF NOT EXISTS vehicle_colors (name TEXT UNIQUE)`);
-  db.run(`CREATE TABLE IF NOT EXISTS vehicle_owners (name TEXT UNIQUE)`);
-});
+};
+initDB();
 
 // الاتصال عبر Socket.io للمزامنة اللحظية
 io.on('connection', (socket) => {
@@ -58,82 +55,88 @@ io.on('connection', (socket) => {
 app.use(express.static(path.join(__dirname, 'web_build')));
 
 // API: جلب السيارات
-app.get('/api/vehicles', (req, res) => {
-  db.all(`SELECT * FROM vehicles ORDER BY entry_time DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const formatted = (rows || []).map(r => ({
-      id: r.id,
-      model: r.model,
-      color: r.color,
-      plateNumber: r.plate_number,
-      ownerName: r.owner_name,
-      entryTime: r.entry_time,
-      isInside: r.is_inside === 1
-    }));
-    res.json(formatted);
-  });
+app.get('/api/vehicles', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, model, color, plate_number AS "plateNumber", owner_name AS "ownerName", entry_time AS "entryTime", is_inside AS "isInside" FROM vehicles ORDER BY entry_time DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: إضافة سيارة جديدة
-app.post('/api/vehicles', (req, res) => {
-  const { id, model, color, plateNumber, ownerName, entryTime, isInside } = req.body;
-  const sql = `INSERT INTO vehicles (id, model, color, plate_number, owner_name, entry_time, is_inside) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-  
-  db.run(sql, [id, model, color, plateNumber, ownerName, entryTime, isInside ? 1 : 0], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+app.post('/api/vehicles', async (req, res) => {
+  try {
+    const { id, model, color, plateNumber, ownerName, entryTime, isInside } = req.body;
+    
+    await pool.query(
+      'INSERT INTO vehicles (id, model, color, plate_number, owner_name, entry_time, is_inside) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, model, color, plateNumber, ownerName, entryTime, isInside ?? true]
+    );
 
-    if (model) db.run(`INSERT OR IGNORE INTO vehicle_models (name) VALUES (?)`, [model]);
-    if (color) db.run(`INSERT OR IGNORE INTO vehicle_colors (name) VALUES (?)`, [color]);
-    if (ownerName) db.run(`INSERT OR IGNORE INTO vehicle_owners (name) VALUES (?)`, [ownerName]);
+    if (model) await pool.query('INSERT INTO vehicle_models (name) VALUES ($1) ON CONFLICT DO NOTHING', [model]);
+    if (color) await pool.query('INSERT INTO vehicle_colors (name) VALUES ($1) ON CONFLICT DO NOTHING', [color]);
+    if (ownerName) await pool.query('INSERT INTO vehicle_owners (name) VALUES ($1) ON CONFLICT DO NOTHING', [ownerName]);
 
     io.emit('vehicles_updated');
     res.status(201).json({ message: 'تم الحفظ والمزامنة بنجاح' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: تعديل بيانات سيارة كاملة
-app.put('/api/vehicles/:id', (req, res) => {
-  const { id } = req.params;
-  const { model, color, plateNumber, ownerName } = req.body;
-  const sql = `UPDATE vehicles SET model = ?, color = ?, plate_number = ?, owner_name = ? WHERE id = ?`;
+app.put('/api/vehicles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { model, color, plateNumber, ownerName } = req.body;
 
-  db.run(sql, [model, color, plateNumber, ownerName, id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+    await pool.query(
+      'UPDATE vehicles SET model = $1, color = $2, plate_number = $3, owner_name = $4 WHERE id = $5',
+      [model, color, plateNumber, ownerName, id]
+    );
 
-    if (model) db.run(`INSERT OR IGNORE INTO vehicle_models (name) VALUES (?)`, [model]);
-    if (color) db.run(`INSERT OR IGNORE INTO vehicle_colors (name) VALUES (?)`, [color]);
-    if (ownerName) db.run(`INSERT OR IGNORE INTO vehicle_owners (name) VALUES (?)`, [ownerName]);
+    if (model) await pool.query('INSERT INTO vehicle_models (name) VALUES ($1) ON CONFLICT DO NOTHING', [model]);
+    if (color) await pool.query('INSERT INTO vehicle_colors (name) VALUES ($1) ON CONFLICT DO NOTHING', [color]);
+    if (ownerName) await pool.query('INSERT INTO vehicle_owners (name) VALUES ($1) ON CONFLICT DO NOTHING', [ownerName]);
 
     io.emit('vehicles_updated');
     res.json({ message: 'تم تحديث البيانات والمزامنة بنجاح' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: تحديث حالة السيارة (دخول / خروج)
-app.put('/api/vehicles/:id/status', (req, res) => {
-  const { id } = req.params;
-  const { isInside } = req.body;
-  db.run(`UPDATE vehicles SET is_inside = ? WHERE id = ?`, [isInside ? 1 : 0, id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    
+app.put('/api/vehicles/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isInside } = req.body;
+
+    await pool.query('UPDATE vehicles SET is_inside = $1 WHERE id = $2', [isInside, id]);
+
     io.emit('vehicles_updated');
     res.json({ message: 'تم التحديث والمزامنة بنجاح' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // API: جلب الموديلات، الألوان، وأسماء الملاك/المكاتب
-app.get('/api/options', (req, res) => {
-  db.all(`SELECT name FROM vehicle_models`, [], (err, models) => {
-    db.all(`SELECT name FROM vehicle_colors`, [], (err, colors) => {
-      db.all(`SELECT name FROM vehicle_owners`, [], (err, owners) => {
-        res.json({
-          models: (models || []).map((m) => m.name),
-          colors: (colors || []).map((c) => c.name),
-          owners: (owners || []).map((o) => o.name),
-        });
-      });
+app.get('/api/options', async (req, res) => {
+  try {
+    const models = await pool.query('SELECT name FROM vehicle_models');
+    const colors = await pool.query('SELECT name FROM vehicle_colors');
+    const owners = await pool.query('SELECT name FROM vehicle_owners');
+
+    res.json({
+      models: models.rows.map(m => m.name),
+      colors: colors.rows.map(c => c.name),
+      owners: owners.rows.map(o => o.name),
     });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Catch-all لربط مسارات الـ Web
