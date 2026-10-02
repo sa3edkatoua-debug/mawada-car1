@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
-const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
 
@@ -51,8 +50,10 @@ io.on('connection', (socket) => {
   console.log('جهاز جديد اتصل بالمزامنة اللحظية:', socket.id);
 });
 
-// خدمة ملفات الويب الناتجة من فلاتر
-app.use(express.static(path.join(__dirname, 'web_build')));
+// صفحة رئيسية بسيطة للتحقق من عمل السيرفر
+app.get('/', (req, res) => {
+  res.send('Vehicle Backend Server is running successfully!');
+});
 
 // API: جلب السيارات
 app.get('/api/vehicles', async (req, res) => {
@@ -137,11 +138,6 @@ app.get('/api/options', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
-
-// Catch-all لربط مسارات الـ Web
-app.use((req, res) => {
-  res.sendFile(path.join(__dirname, 'web_build', 'index.html'));
 });
 
 const PORT = process.env.PORT || 3000;
