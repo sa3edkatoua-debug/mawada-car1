@@ -123,6 +123,17 @@ app.put('/api/vehicles/:id/status', async (req, res) => {
   }
 });
 
+// API: تصفير جدول السيارات فقط مع الحفاظ على القوائم الأساسية
+app.delete('/api/vehicles/reset', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM vehicles');
+    io.emit('vehicles_updated');
+    res.json({ message: 'تم تصفير سجلات السيارات بنجاح مع الحفاظ على القوائم' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // API: جلب الموديلات، الألوان، وأسماء الملاك/المكاتب
 app.get('/api/options', async (req, res) => {
   try {
