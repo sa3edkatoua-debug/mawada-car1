@@ -65,7 +65,7 @@ app.get('/api/vehicles', async (req, res) => {
   }
 });
 
-// API: إضافة سيارة جديدة
+// API: إضافة سيارة جديدة مع حفظ الخيارات تلقائياً
 app.post('/api/vehicles', async (req, res) => {
   try {
     const { id, model, color, plateNumber, ownerName, entryTime, isInside } = req.body;
@@ -134,12 +134,12 @@ app.delete('/api/vehicles/reset', async (req, res) => {
   }
 });
 
-// API: جلب الموديلات، الألوان، وأسماء الملاك/المكاتب
+// API: جلب الموديلات، الألوان، وأسماء الملاك/المكاتب مرتبة أبدياً
 app.get('/api/options', async (req, res) => {
   try {
-    const models = await pool.query('SELECT name FROM vehicle_models');
-    const colors = await pool.query('SELECT name FROM vehicle_colors');
-    const owners = await pool.query('SELECT name FROM vehicle_owners');
+    const models = await pool.query('SELECT name FROM vehicle_models ORDER BY name ASC');
+    const colors = await pool.query('SELECT name FROM vehicle_colors ORDER BY name ASC');
+    const owners = await pool.query('SELECT name FROM vehicle_owners ORDER BY name ASC');
 
     res.json({
       models: models.rows.map(m => m.name),
